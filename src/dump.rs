@@ -1,7 +1,6 @@
-//! Orchestration: load modules, apply names (bindings, signatures, user
-//! names), build the program model and derive named layouts.
+//! Orchestration: load modules, apply names (signatures, user names) and
+//! build the program model.
 
-use crate::bindings::{Bindings, LayoutCtx};
 use crate::model::{Module, NameSrc, World};
 use crate::names;
 use crate::sigs::{self, Kind, Sig, SigResult, Want};
@@ -17,34 +16,12 @@ pub struct NamedField {
     pub source: NameSrc,
 }
 
-#[derive(Clone, Debug)]
-pub enum LayoutStatus {
-    /// Computed end matches the size measured in the binary.
-    Verified { size: u64 },
-    Mismatch { computed: u64, measured: u64 },
-    Unmeasured { computed: u64 },
-    Failed(String),
-}
-
-#[derive(Clone, Debug)]
-pub struct BindingsMatch {
-    pub source: String,
-    pub checked: usize,
-    pub hits: usize,
-    pub applied: bool,
-}
-
 pub struct Report {
     pub world: World,
     pub exe: usize,
-    /// class -> offset -> names (direct members first, then flattened
-    /// members of embedded structs such as `m_gameState.m_cameraZoom`).
+    /// class -> offset -> names.
     pub named_fields: BTreeMap<String, BTreeMap<i32, Vec<NamedField>>>,
-    /// struct -> (container class, member path) for every by-value embedding.
-    pub embeds: BTreeMap<String, Vec<(String, String)>>,
-    pub layout_status: BTreeMap<String, LayoutStatus>,
     pub named_globals: BTreeMap<(usize, u32), String>,
-    pub bindings: Option<BindingsMatch>,
     pub sig_results: Vec<SigResult>,
     pub user_names: usize,
 }
@@ -52,8 +29,6 @@ pub struct Report {
 pub struct Options {
     pub game_dir: PathBuf,
     pub modules: Vec<String>,
-    pub bindings: Option<PathBuf>,
-    pub force_bindings: bool,
     pub sigs: Vec<PathBuf>,
     pub names: Vec<PathBuf>,
 }
@@ -81,57 +56,6 @@ pub fn run(opts: &Options) -> Result<Report> {
     anyhow::ensure!(!mods.is_empty(), "no modules loaded from {}", opts.game_dir.display());
     let exe = mods.iter().position(|m| m.pe.name.to_ascii_lowercase().ends_with(".exe")).unwrap_or(0);
 
-    // --- names from bindings
-    let bro = match &opts.bindings {
-        Some(p) => Some(Bindings::load(p)?),
-        None => None,
-    };
-    let mut bmatch = None;
-    if let Some(b) = &bro {
-        let m = &mut mods[exe];
-        let fns: Vec<_> = b.functions().filter_map(|f| f.win.map(|a| (f, a))).collect();
-        let pdata: std::collections::HashSet<u32> = m.pe.runtime_functions.iter().map(|f| f.begin).collect();
-        let hits = fns.iter().filter(|(_, a)| m.code.funcs.contains_key(a) || pdata.contains(a)).count();
-        let ratio = hits as f64 / fns.len().max(1) as f64;
-        if ratio >= 0.85 || opts.force_bindings {
-            // Leaf functions only referenced indirectly are not found by the sweep.
-            let extra: Vec<u32> = fns.iter().map(|(_, a)| *a).collect();
-            let n = m.add_functions(&extra);
-            if n > 0 {
-                eprintln!("[+] bindings: analysed {n} extra functions");
-            }
-        }
-        let hits = fns.iter().filter(|(_, a)| m.code.funcs.contains_key(a)).count();
-        let ratio = hits as f64 / fns.len().max(1) as f64;
-        let applied = ratio >= 0.85 || opts.force_bindings;
-        eprintln!(
-            "[+] bindings: {} classes, {} win addresses, {:.1}% land on function starts{}",
-            b.classes.len(),
-            fns.len(),
-            ratio * 100.0,
-            if applied { "" } else { " -> NOT applied (different game version? use --force-bindings)" }
-        );
-        if applied {
-            for (f, a) in &fns {
-                if m.code.funcs.contains_key(a) {
-                    m.set_name(*a, format!("{}::{}", f.class, f.name), NameSrc::Bindings, f.is_static);
-                }
-            }
-        }
-        if applied {
-            let n = fill_virtual_gaps(&mut mods, exe, b);
-            if n > 0 {
-                eprintln!("[+] bindings: named {n} inline virtuals from declaration order");
-            }
-        }
-        bmatch = Some(BindingsMatch {
-            source: opts.bindings.as_ref().unwrap().display().to_string(),
-            checked: fns.len(),
-            hits,
-            applied,
-        });
-    }
-
     // --- signatures from previous dumps / hand-written files
     let mut all_sigs: Vec<Sig> = Vec::new();
     let mut extras: Vec<sigs::Extra> = Vec::new();
@@ -157,6 +81,7 @@ pub fn run(opts: &Options) -> Result<Report> {
             match r.sig.kind {
                 Kind::Func => {
                     let m = &mut mods[*mi];
+                    m.add_functions(&[v as u32]);
                     if m.code.funcs.contains_key(&(v as u32)) {
                         m.set_name(v as u32, r.sig.name.clone(), NameSrc::Signature, false);
                     }
@@ -237,7 +162,10 @@ pub fn run(opts: &Options) -> Result<Report> {
             let Some(v) = parse_num(parts[2]) else { continue };
             user_names += 1;
             match parts[0] {
-                "func" | "fn" => mods[exe].set_name(v as u32, parts[1].to_string(), NameSrc::User, false),
+                "func" | "fn" => {
+                    mods[exe].add_functions(&[v as u32]);
+                    mods[exe].set_name(v as u32, parts[1].to_string(), NameSrc::User, false)
+                }
                 "global" | "data" => {
                     named_globals.insert((exe, v as u32), parts[1].to_string());
                 }
@@ -269,70 +197,7 @@ pub fn run(opts: &Options) -> Result<Report> {
         }
     }
 
-    // --- named member layouts from the bindings
     let mut named_fields: BTreeMap<String, BTreeMap<i32, Vec<NamedField>>> = BTreeMap::new();
-    let mut embeds: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-    let mut layout_status = BTreeMap::new();
-    if let (Some(b), Some(bm)) = (&bro, &bmatch) {
-        let _ = bm;
-        // Interfaces without data members (delegates, protocols) are just a vptr.
-        fn iface(world: &World, n: &str, depth: u32) -> Option<u64> {
-            let c = world.classes.get(n)?;
-            if let Some(s) = c.size.or(c.inferred_size) {
-                return Some(s);
-            }
-            if !c.has_chd || depth > 16 {
-                return None;
-            }
-            // Pure interface chain: every base sits at offset 0 and is itself an interface.
-            let mut size = 8;
-            for b in &c.direct_bases {
-                if b.mdisp != 0 {
-                    return None;
-                }
-                size = size.max(iface(world, &b.name, depth + 1)?);
-            }
-            (size == 8).then_some(8)
-        }
-        let measured = |n: &str| iface(&world, n, 0);
-        let exact = |n: &str| world.classes.get(n).and_then(|c| c.size);
-        let rtti_bases = |n: &str| {
-            world.classes.get(n).filter(|c| c.module.is_some() || !c.all_bases.is_empty()).map(|c| {
-                c.direct_bases.iter().filter(|b| b.pdisp == -1).map(|b| (b.name.clone(), b.mdisp)).collect::<Vec<_>>()
-            })
-        };
-        let ctx = LayoutCtx { bro: b, measured: &measured, rtti_bases: &rtti_bases, cache: Default::default() };
-        for name in b.classes.keys() {
-            let l = ctx.layout(name);
-            if l.members.is_empty() && l.error.is_none() {
-                continue;
-            }
-            let status = match (&l.error, exact(name)) {
-                (Some(e), _) => LayoutStatus::Failed(e.clone()),
-                (None, Some(s)) if s == l.end => LayoutStatus::Verified { size: s },
-                (None, Some(s)) => LayoutStatus::Mismatch { computed: l.end, measured: s },
-                (None, None) => LayoutStatus::Unmeasured { computed: l.end },
-            };
-            let e = named_fields.entry(name.clone()).or_default();
-            for mm in &l.members {
-                e.entry(mm.offset as i32).or_default().push(NamedField {
-                    name: mm.name.clone(),
-                    ty: mm.ty.clone(),
-                    size: mm.size,
-                    source: NameSrc::Bindings,
-                });
-            }
-            layout_status.insert(name.clone(), status);
-        }
-        // Embedded value structs: expose their members with full paths.
-        let direct: Vec<(String, i32, NamedField)> = named_fields
-            .iter()
-            .flat_map(|(c, m)| m.iter().flat_map(move |(o, v)| v.iter().map(move |f| (c.clone(), *o, f.clone()))))
-            .collect();
-        for (c, off, f) in direct {
-            flatten(&ctx, &mut named_fields, &mut embeds, &c, off, &f.name, &f.ty, 0);
-        }
-    }
     for (c, off, f, src) in sig_fields {
         let v = named_fields.entry(c).or_default().entry(off).or_default();
         if !v.iter().any(|n| n.name == f) {
@@ -363,138 +228,7 @@ pub fn run(opts: &Options) -> Result<Report> {
     }
 
     let sig_results = sig_results.into_iter().map(|r| r.1).collect();
-    Ok(Report { world, exe, named_fields, embeds, layout_status, named_globals, bindings: bmatch, sig_results, user_names })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn flatten(
-    ctx: &LayoutCtx,
-    out: &mut BTreeMap<String, BTreeMap<i32, Vec<NamedField>>>,
-    embeds: &mut BTreeMap<String, Vec<(String, String)>>,
-    class: &str,
-    base_off: i32,
-    path: &str,
-    ty: &str,
-    depth: u32,
-) {
-    let t = ty.trim().trim_start_matches("const ").trim();
-    if depth > 3 || t.ends_with('*') || t.ends_with('&') || t.contains('<') {
-        return;
-    }
-    let Some(q) = ctx.qualify(t) else { return };
-    if ctx.bro.classes.get(&q).is_none_or(|c| c.members.is_empty()) {
-        return;
-    }
-    let l = ctx.layout(&q);
-    if l.error.is_some() || l.members.is_empty() {
-        return;
-    }
-    embeds.entry(q.clone()).or_default().push((class.to_string(), path.to_string()));
-    for m in &l.members {
-        let p = format!("{path}.{}", m.name);
-        let off = base_off + m.offset as i32;
-        out.entry(class.to_string())
-            .or_default()
-            .entry(off)
-            .or_default()
-            .push(NamedField { name: p.clone(), ty: m.ty.clone(), size: m.size, source: NameSrc::Bindings });
-        flatten(ctx, out, embeds, class, off, &p, &m.ty, depth + 1);
-    }
-}
-
-/// Virtuals the bindings declare without a Windows address (`= win inline`)
-/// still occupy vtable slots in declaration order. Between two virtuals with
-/// known slots, an exact-size gap of unnamed slots is filled in order.
-fn fill_virtual_gaps(mods: &mut [Module], exe: usize, b: &Bindings) -> usize {
-    let vt_len = |mods: &[Module], class: &str| -> Option<usize> {
-        mods.iter().find_map(|m| m.rtti.class(class).and_then(|c| c.primary_vtable()).map(|v| v.entries.len()))
-    };
-    let mut assign: Vec<(u32, (String, u32, usize), String)> = Vec::new();
-    {
-        let m = &mods[exe];
-        for (cname, bc) in &b.classes {
-            let Some(cls) = m.rtti.class(cname) else { continue };
-            let Some(vt) = cls.primary_vtable() else { continue };
-            let base_len = cls.primary_base().and_then(|pb| vt_len(mods, &pb.name)).unwrap_or(0);
-            let targets: Vec<u32> = vt.entries.iter().map(|&e| m.resolve_entry(e).0).collect();
-            let _ = base_len;
-            let slot_of = |addr: u32| (0..targets.len()).find(|&i| targets[i] == addr);
-            // (slot or None, name) for virtuals in declaration order.
-            let decls: Vec<(Option<usize>, &str)> = bc
-                .functions
-                .iter()
-                .filter(|f| f.is_virtual && !f.name.starts_with('~'))
-                .map(|f| (f.win.and_then(slot_of), f.name.as_str()))
-                .collect();
-            let mut last: Option<usize> = None;
-            let mut pending: Vec<&str> = Vec::new();
-            for (slot, name) in decls {
-                match slot {
-                    Some(s) => {
-                        if let Some(l) = last {
-                            if !pending.is_empty() && s > l && s - l - 1 == pending.len() {
-                                for (k, n) in pending.iter().enumerate() {
-                                    let i = l + 1 + k;
-                                    assign.push((targets[i], (cname.clone(), 0, i), format!("{cname}::{n}")));
-                                }
-                            }
-                        }
-                        last = Some(s);
-                        pending.clear();
-                    }
-                    None if last.is_some() => pending.push(name),
-                    None => {}
-                }
-            }
-            // Trailing run up to the end of the vtable.
-            if let Some(l) = last {
-                if !pending.is_empty() && targets.len() - l - 1 == pending.len() {
-                    for (k, n) in pending.iter().enumerate() {
-                        let i = l + 1 + k;
-                        assign.push((targets[i], (cname.clone(), 0, i), format!("{cname}::{n}")));
-                    }
-                }
-            }
-        }
-    }
-    // Interfaces whose virtuals are all inline: declaration order is the slot order.
-    for (cname, bc) in &b.classes {
-        let decls: Vec<&str> = bc.functions.iter().filter(|f| f.is_virtual && !f.name.starts_with('~')).map(|f| f.name.as_str()).collect();
-        if decls.is_empty() || bc.functions.iter().any(|f| f.is_virtual && f.win.is_some()) {
-            continue;
-        }
-        let mut uniq = decls.clone();
-        uniq.sort();
-        uniq.dedup();
-        if uniq.len() != decls.len() {
-            continue; // overloads are reordered by MSVC
-        }
-        let rtti = mods.iter().find_map(|m| m.rtti.class(cname));
-        let Some(rc) = rtti else { continue };
-        if !rc.direct_bases.is_empty() && rc.chd_rva.is_some() {
-            continue;
-        }
-        if let Some(v) = rc.primary_vtable() {
-            if v.entries.len() != decls.len() {
-                continue;
-            }
-        }
-        for (i, n) in decls.iter().enumerate() {
-            let key = (cname.clone(), 0, i);
-            if !mods[exe].slot_names.contains_key(&key) {
-                assign.push((u32::MAX, key, format!("{cname}::{n}")));
-            }
-        }
-    }
-    let m = &mut mods[exe];
-    let n = assign.len();
-    for (t, slot, name) in assign {
-        m.slot_names.insert(slot, name.clone());
-        if t != u32::MAX && m.entry_import(t).is_none() && m.names.get(&t).is_none_or(|x| x.source < NameSrc::Signature) {
-            m.set_name(t, name, NameSrc::Bindings, false);
-        }
-    }
-    n
+    Ok(Report { world, exe, named_fields, named_globals, sig_results, user_names })
 }
 
 fn parse_num(s: &str) -> Option<i64> {
@@ -506,7 +240,7 @@ fn parse_num(s: &str) -> Option<i64> {
 
 /// Generate signatures for everything that has a real name in this dump, so
 /// the next game update can be dumped with `--sigs` and keep all names.
-pub fn make_signatures(r: &Report, include_unverified_fields: bool) -> (Vec<Sig>, Vec<sigs::Extra>, Vec<String>) {
+pub fn make_signatures(r: &Report) -> (Vec<Sig>, Vec<sigs::Extra>, Vec<String>) {
     let nmods = r.world.modules.len();
     let mut wants: Vec<Vec<Want>> = (0..nmods).map(|_| Vec::new()).collect();
     for (mi, m) in r.world.modules.iter().enumerate() {
@@ -524,24 +258,8 @@ pub fn make_signatures(r: &Report, include_unverified_fields: bool) -> (Vec<Sig>
     }
     for (cls, fields) in &r.named_fields {
         let fmi = r.world.classes.get(cls).and_then(|c| c.module).unwrap_or(r.exe);
-        let ok = match r.layout_status.get(cls) {
-            Some(LayoutStatus::Verified { .. }) => true,
-            // Plain structs have no measured size; they are recovered through
-            // their embedding containers.
-            Some(LayoutStatus::Unmeasured { .. }) => include_unverified_fields || r.embeds.contains_key(cls),
-            Some(_) => include_unverified_fields,
-            None => true,
-        };
-        if !ok {
-            continue;
-        }
-        let bindings_trusted = r.bindings.as_ref().is_some_and(|b| b.applied);
         for (&off, fs) in fields {
             for f in fs {
-                // Layouts from bindings of another build are shown, but not carried forward.
-                if f.source == NameSrc::Bindings && !bindings_trusted {
-                    continue;
-                }
                 wants[fmi].push(Want::Field { name: format!("{cls}::{}", f.name), class: cls.clone(), offset: off });
             }
         }
@@ -590,13 +308,6 @@ pub fn make_signatures(r: &Report, include_unverified_fields: bool) -> (Vec<Sig>
             }
         }
         if let Some((cls, fname)) = names::split_member(&name) {
-            // Struct member: recover it from an embedding container.
-            if let Some(uses) = r.embeds.get(cls) {
-                if let Some((c, path)) = uses.first() {
-                    extras.push(sigs::Extra::RelSub { name: name.clone(), anchor: format!("{c}::{path}.{fname}"), minus: format!("{c}::{path}") });
-                    continue;
-                }
-            }
             if let Some(fields) = r.named_fields.get(cls) {
                 if let Some(off) = fields.iter().find_map(|(o, v)| v.iter().any(|f| f.name == fname).then_some(*o)) {
                     // Nearest signed field in the same class (prefer the one before).

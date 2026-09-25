@@ -1,7 +1,7 @@
 //! Text (and JSON) writers for a finished dump.
 
 use crate::analysis::{Access, Trivial};
-use crate::dump::{LayoutStatus, Report};
+use crate::dump::Report;
 use crate::model::{Module, NameSrc};
 use crate::names;
 use anyhow::Result;
@@ -91,17 +91,6 @@ fn header(r: &Report, s: &mut String) {
             m.pe.entry
         );
     }
-    if let Some(b) = &r.bindings {
-        let _ = writeln!(
-            s,
-            "\n  bindings: {}  ({}/{} addresses match = {:.1}%, {})",
-            b.source,
-            b.hits,
-            b.checked,
-            100.0 * b.hits as f64 / b.checked.max(1) as f64,
-            if b.applied { "applied" } else { "NOT applied: different game version" }
-        );
-    }
     if !r.sig_results.is_empty() {
         let ok = r.sig_results.iter().filter(|x| x.value.is_some()).count();
         let _ = writeln!(s, "  signatures: {ok}/{} resolved", r.sig_results.len());
@@ -158,7 +147,7 @@ pub fn offsets_txt(r: &Report) -> String {
     let _ = writeln!(s, " CLASSES");
     let _ = writeln!(s, "==================================================================");
     let _ = writeln!(s, " field columns: offset  size  type-hint  reads/writes/addr-taken  #funcs  name");
-    let _ = writeln!(s, " names: [B] Geode bindings layout, [S] signature, [U] user, (get/set) accessor-derived");
+    let _ = writeln!(s, " names: [S] signature, [U] user, (get/set) accessor-derived");
     let _ = writeln!(s);
 
     let mut all: BTreeSet<String> = w.classes.iter().filter(|(_, c)| c.module.is_some() || c.size.is_some()).map(|(n, _)| n.clone()).collect();
@@ -196,21 +185,6 @@ pub fn offsets_txt(r: &Report) -> String {
                     }
                 }
             }
-        }
-        if let Some(st) = r.layout_status.get(cname) {
-            let _ = write!(
-                s,
-                "   bindings layout: {}",
-                match st {
-                    LayoutStatus::Verified { size } if r.bindings.as_ref().is_some_and(|b| b.applied) =>
-                        format!("VERIFIED (ends at {})", hex(*size)),
-                    LayoutStatus::Verified { size } => format!("size matches (ends at {}), bindings are from another build", hex(*size)),
-                    LayoutStatus::Mismatch { computed, measured } =>
-                        format!("MISMATCH (computed {} vs measured {}) — names may be shifted", hex(*computed), hex(*measured)),
-                    LayoutStatus::Unmeasured { computed } => format!("unchecked (ends at {})", hex(*computed)),
-                    LayoutStatus::Failed(e) => format!("incomplete ({e})"),
-                }
-            );
         }
         let _ = writeln!(s);
         if let Some(i) = mi {
@@ -263,7 +237,6 @@ pub fn offsets_txt(r: &Report) -> String {
             let mut name = String::new();
             if let Some(n) = nf {
                 let tag = match n.source {
-                    NameSrc::Bindings => "B",
                     NameSrc::Signature => "S",
                     _ => "U",
                 };

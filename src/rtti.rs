@@ -51,9 +51,6 @@ impl Class {
     pub fn primary_vtable(&self) -> Option<&Vtable> {
         self.vtables.iter().find(|v| v.offset == 0)
     }
-    pub fn primary_base(&self) -> Option<&BaseClass> {
-        self.direct_bases.iter().find(|b| b.mdisp == 0 && b.vdisp == 0 && b.pdisp == -1)
-    }
 }
 
 pub struct Rtti {

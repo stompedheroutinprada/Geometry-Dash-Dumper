@@ -17,7 +17,6 @@ pub enum NameSrc {
     Import,
     Export,
     Signature,
-    Bindings,
     User,
 }
 
@@ -29,7 +28,6 @@ impl NameSrc {
             NameSrc::Import => "import",
             NameSrc::Export => "export",
             NameSrc::Signature => "signature",
-            NameSrc::Bindings => "bindings",
             NameSrc::User => "user",
         }
     }
@@ -159,7 +157,7 @@ impl Module {
         best.into_values().map(|v| v.2).collect()
     }
 
-    /// Analyse extra entry points (e.g. from bindings) the sweep did not reach.
+    /// Analyse extra entry points the sweep did not reach.
     pub fn add_functions(&mut self, rvas: &[u32]) -> usize {
         let new: Vec<u32> = rvas.iter().copied().filter(|r| self.pe.is_exec(*r) && !self.code.funcs.contains_key(r)).collect();
         if new.is_empty() {
@@ -470,11 +468,11 @@ impl Module {
             }
         }
 
-        // Named functions (exports / bindings / signatures). Identical-code-folded
+        // Named functions (exports / signatures / user names). Identical-code-folded
         // functions carry several names; only trust them when the class agrees.
         let mut named: HashMap<u32, BTreeSet<String>> = HashMap::new();
         for (&rva, n) in &self.names {
-            if n.is_static || !matches!(n.source, NameSrc::Export | NameSrc::Bindings | NameSrc::Signature | NameSrc::User) {
+            if n.is_static || !matches!(n.source, NameSrc::Export | NameSrc::Signature | NameSrc::User) {
                 continue;
             }
             if let Some((cls, _)) = names::split_member(&n.name) {
@@ -830,7 +828,7 @@ impl World {
     }
 
     /// Name every vtable slot using the whole hierarchy (cocos exports,
-    /// bindings of base classes, ...). Returns (slot name, inherited-from).
+    /// names of base classes, ...). Returns (slot name, inherited-from).
     pub fn slot_name(&self, mi: usize, class: &str, vt_off: u32, slot: usize, entry: u32) -> (String, Option<String>) {
         let m = &self.modules[mi];
         let short = names::unqualified(class).to_string();
